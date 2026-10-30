@@ -1,8 +1,8 @@
 # Submission: MT Kulsary / FRIKT333
 
 ## Links
-- **Repository, final commit:** https://github.com/FRIKT333/soup-kernel-challenge/commit/08e655320cc82347699802aab3356b96c4b56f65
-- **Official Hackathon Private Repo:** https://github.com/BAITC-Hacks/hack-81eedec3-mtkulsary/commit/08e655320cc82347699802aab3356b96c4b56f65
+- **Repository, final commit:** https://github.com/FRIKT333/soup-kernel-challenge/commit/2b01c9d
+- **Official Hackathon Private Repo:** https://github.com/BAITC-Hacks/hack-81eedec3-mtkulsary/commit/2b01c9d
 - **Public Kaggle notebook:** https://www.kaggle.com/code/romankravshenko/soup-kernel-challenge-t4
 - **Demo video (up to 3 minutes):** [Link to Video]
 - **Presentation:** [Link to Presentation]
