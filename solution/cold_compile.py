@@ -34,19 +34,24 @@ def _jobs(buffers):
 
     # RMSNorm forward / backward
     yield frozen_rms_forward_kernel, (h, f, h, f, h, h, 1536, 1.e-6, 2048, False), dict(num_warps=4, enable_fp_fusion=False)
+    yield frozen_rms_forward_kernel, (h, f, h, f, i, h, 1536, 1.e-6, 2048, True), dict(num_warps=4, enable_fp_fusion=False)
     yield frozen_rms_backward_kernel, (h, h, h, f, f, i, h, 1536, 2048, True, False, False), dict(num_warps=4, enable_fp_fusion=False)
+    yield frozen_rms_backward_kernel, (h, h, h, f, f, i, h, 1536, 2048, True, True, True), dict(num_warps=4, enable_fp_fusion=False)
 
     # NF4 double decode / MLP decode
     yield nf4_double_decode_kernel, (u, u, f, f, f, f, h, 1536 * 1536, 64, 256, 1024), dict(num_warps=4, enable_fp_fusion=False)
     yield nf4_mlp_decode_kernel, (u, u, f, f, f, f, u, u, f, f, f, f, u, u, f, f, f, f, h, 1536 * 8960, 1024), dict(num_warps=4, enable_fp_fusion=False)
 
-    # LoRA kernels
+    # LoRA kernels (q_proj N=1536, v_proj N=256)
     yield lora_up_add_kernel, (h, h, h, h, 701, 1536, 16, 2.0, False, 32, 128), dict(num_warps=4, enable_fp_fusion=False)
+    yield lora_up_add_kernel, (h, h, h, h, 701, 256, 16, 2.0, False, 32, 128), dict(num_warps=4, enable_fp_fusion=False)
     yield lora_cast_scale_gradient_kernel, (h, h, 701 * 1536, 2.0, 1024), {}
 
-    # Attention rotary
-    yield packed_rotary_kernel, (h, h, h, h, 701 * 12 * 128, 12, 128, False, 1024), dict(enable_fp_fusion=False)
-    yield packed_rotary_kernel, (h, h, h, h, 701 * 12 * 128, 12, 128, True, 1024), dict(enable_fp_fusion=False)
+    # Attention rotary (Q heads H=12, KV heads H=2, with FP16 product rounding)
+    yield packed_rotary_kernel, (h, h, h, h, 701 * 12 * 128, 12, 128, False, 1024), dict(enable_fp_fusion=False, ROUND_PRODUCTS=True)
+    yield packed_rotary_kernel, (h, h, h, h, 701 * 12 * 128, 12, 128, True, 1024), dict(enable_fp_fusion=False, ROUND_PRODUCTS=True)
+    yield packed_rotary_kernel, (h, h, h, h, 701 * 2 * 128, 2, 128, False, 1024), dict(enable_fp_fusion=False, ROUND_PRODUCTS=True)
+    yield packed_rotary_kernel, (h, h, h, h, 701 * 2 * 128, 2, 128, True, 1024), dict(enable_fp_fusion=False, ROUND_PRODUCTS=True)
 
     # Dropout forward / backward
     yield packed_dropout_forward_kernel, (h, i, f, b, h, b, 701 * 1536, 1536, 1024), dict(enable_fp_fusion=False)
@@ -54,12 +59,13 @@ def _jobs(buffers):
 
     # Online vocabulary gradient
     yield online_vocabulary_gradient_kernel, (h, i, f, f, i, h, 256, 151936, 256, BLOCK), dict(num_warps=4, enable_fp_fusion=False)
+    yield online_vocabulary_gradient_kernel, (h, i, f, f, i, h, 128, 151936, 128, BLOCK), dict(num_warps=4, enable_fp_fusion=False)
 
     # SwiGLU forward / backward
     yield example_swiglu_fwd_kernel, (h, h, h, 701 * 8960, 1024), {}
     yield example_swiglu_bwd_kernel, (h, h, h, h, h, 701 * 8960, 1024), {}
     yield example_joint_swiglu_fwd_kernel, (h, h, 701 * 8960, 8960, 1024), {}
-    yield example_joint_swiglu_bwd_kernel, (h, h, h, h, 701 * 8960, 8960, 1024), {}
+    yield example_joint_swiglu_bwd_kernel, (h, h, h, 701 * 8960, 8960, 1024), {}
 
 
 class Compilation:

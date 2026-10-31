@@ -10,7 +10,7 @@ from torch.autograd.function import once_differentiable
 from .compact import _tokens, _restore, _pack, _adapter_full_input
 
 
-@triton.jit
+@triton.jit(do_not_specialize=['TOTAL'])
 def packed_rotary_kernel(X, COS, SIN, OUT, TOTAL, H: tl.constexpr,
                           D: tl.constexpr, BACKWARD: tl.constexpr, BLOCK: tl.constexpr,
                           ROUND_PRODUCTS: tl.constexpr = False):

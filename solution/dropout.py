@@ -10,7 +10,7 @@ import triton.language as tl
 from torch.autograd.function import once_differentiable
 
 
-@triton.jit
+@triton.jit(do_not_specialize=['N'])
 def packed_dropout_forward_kernel(X, INDEX, SCALE, MASK, OUT, SAVED_MASK,
                                    N, WIDTH: tl.constexpr, BLOCK: tl.constexpr):
     i = tl.program_id(0)*BLOCK + tl.arange(0,BLOCK)
@@ -24,7 +24,7 @@ def packed_dropout_forward_kernel(X, INDEX, SCALE, MASK, OUT, SAVED_MASK,
     tl.store(SAVED_MASK + i, mask, i < N)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=['N', 'SCALE'])
 def packed_dropout_backward_kernel(GRAD, MASK, OUT, N, SCALE,
                                     BLOCK: tl.constexpr):
     i = tl.program_id(0)*BLOCK + tl.arange(0,BLOCK)

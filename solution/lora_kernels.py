@@ -30,7 +30,7 @@ def lora_up_add_kernel(H, B, BASE, OUT, M, N: tl.constexpr,
              base.to(tl.float32) + scaled.to(tl.float32), mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=['SIZE'])
 def lora_cast_scale_gradient_kernel(G, OUT, SIZE, SCALE: tl.constexpr, BLOCK: tl.constexpr):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     g = tl.load(G + offsets, offsets < SIZE, 0).to(OUT.dtype.element_ty)
