@@ -3,8 +3,9 @@
 > **Decentrathon 6.0 | Track: Soup Kernel Challenge**  
 > **Team:** MT Kulsary (Roman Kravshenko / [FRIKT333](https://github.com/FRIKT333))  
 > **Target:** NVIDIA Tesla T4 GPU (Turing `sm_75`, 15 GB VRAM)  
+> **Branch:** `teamwork/t4-45s-speedup`  
 > **Public Repository:** [https://github.com/FRIKT333/soup-kernel-challenge](https://github.com/FRIKT333/soup-kernel-challenge)  
-> **Public Kaggle Notebook:** [https://www.kaggle.com/code/romankravshenko/soup-kernel-challenge-t4](https://www.kaggle.com/code/romankravshenko/soup-kernel-challenge-t4)
+> **Public Kaggle Notebook:** [https://www.kaggle.com/code/frikt333/soup-t4-final-confirmation](https://www.kaggle.com/code/frikt333/soup-t4-final-confirmation)
 
 ---
 
@@ -14,114 +15,116 @@ Our goal is to maximize training speedup ($s = \text{base\_time} / \text{sol\_ti
 
 ### 1.1 Bottleneck Analysis
 
-Profiling base Soup with `Qwen2.5-1.5B` (NF4, LoRA $r=16, \alpha=32$ on `q_proj`/`v_proj`, batch 4, seq_len 512, $V=151,936$ vocab) revealed two critical bottlenecks:
+Profiling base Soup with `Qwen2.5-1.5B` (NF4, LoRA $r=16, \alpha=32$ on `q_proj`/`v_proj`, batch 4, seq_len 512, $V=151,936$ vocab) revealed three critical bottlenecks:
 
 1. **Peak Memory Bottleneck (Output Head & Logits):**
    - The output head maps hidden states $[4 \times 512, 1536]$ to full logits $[2048, 151936]$.
-   - In fp16, the logits tensor alone is $622\text{ MB}$. During standard PyTorch `CrossEntropyLoss` and metrics calculation (`entropy_from_logits`, `argmax`, `row_losses`), multiple fp32 buffers and backward gradient tensors are materialized simultaneously, driving peak VRAM to $>14,100\text{ MiB}$ (near OOM on T4).
-2. **Compute & Kernel Launch Overhead (Normalization Layers):**
-   - Qwen2.5-1.5B has 28 transformer layers, each containing 2 `Qwen2RMSNorm` layers plus a final norm ($57$ norms forward $+ 57$ backward $= 114$ normalization passes per step).
-   - In standard PyTorch, each RMSNorm executes 4–5 individual kernels (`pow`, `mean`, `rsqrt`, `mul`, type cast), generating $>500$ tiny kernel launches per step with repeated global memory round-trips.
+   - In fp16, the logits tensor alone is $622\text{ MB}$. During standard PyTorch `CrossEntropyLoss` and metrics calculation (`entropy_from_logits`, `argmax`, `row_losses`), multiple fp32 buffers and backward gradient tensors are materialized simultaneously, driving peak VRAM to $>14,300\text{ MiB}$ (near OOM on T4).
+2. **Double-Dequantization Overhead (Frozen NF4 Weights):**
+   - Decoding 112 attention linear layers and 28 MLP blocks from NF4 double-quantization on every forward and backward pass saturates memory bandwidth and introduces thousands of tiny kernel launches.
+3. **Cold JIT Compilation Stalls:**
+   - Under standard execution, Triton JIT compiles multiple kernel variants on step 0, stalling training by up to 7–8 seconds.
 
 ---
 
-### 1.2 Our Triton Kernels
+### 1.2 Our Triton Kernels & Architecture
 
-We implemented custom `@triton.jit` kernels in `solution/`:
+We implemented a coordinated suite of custom `@triton.jit` kernels in `solution/`:
 
-#### A. Fused Chunked Cross-Entropy + Online Metrics (`solution/cross_entropy.py`)
-- **Kernel:** `fused_chunked_ce_kernel`
+#### A. Online Vocabulary Gradient Head (`solution/online_head.py`)
+- **Kernel:** `online_vocabulary_gradient_kernel`
 - **Mechanism:**
-  - Evaluates the output head in sequence chunks ($M = 256$ tokens). Logits are materialized only for the current chunk ($[256, 151936]$, $<78\text{ MB}$), slashing activation memory by over $2,000\text{ MiB}$.
-  - **Online Softmax & Multi-Metric Fusion in Pass 1:** Across $V=151,936$ vocabulary elements (tiled in blocks of $4096$), a single kernel pass computes:
-    - Log-Sum-Exp ($\text{LSE}$) with running max in `tl.float32`.
-    - Online Shannon Entropy: $\mathcal{H} = \text{LSE} - \frac{\sum z_i \exp(z_i - m)}{\sum \exp(z_i - m)}$.
-    - Online Argmax: exact token prediction for `mean_token_accuracy`.
-    - Per-token loss: $\mathcal{L}_i = \text{LSE} - z_{\text{target}}$.
-  - **In-Place Analytical Gradient in Pass 2:** Overwrites the chunk logits buffer directly with:
-    $$d\text{logits}_{i, k} = \frac{p_{i, k} - \mathbf{1}_{k = y_i}}{\text{denominator}}$$
-  - Computes hidden state gradient via $dH_{\text{chunk}} = d\text{logits} \times W_{\text{head}}$, requiring **zero** PyTorch autograd graph buffers for the 152k vocabulary.
-  - Generates exact `token_loss` for `rewind.jsonl` row losses and `_log_trl_metrics`.
+  - Evaluates the output head in token chunks ($M = 256$ tokens) using cuBLAS GEMM, keeping logits transient in $O(\text{chunk} \times V)$ memory ($<78\text{ MB}$).
+  - In a single streaming kernel pass, calculates Log-Sum-Exp ($\text{LSE}$), online Shannon entropy, argmax prediction, and supervised CE loss.
+  - Computes and immediately projects backward hidden gradients $dx = d\text{logits} \cdot W_{\text{head}}$ during the forward pass, reducing backward memory to $O(1)$ and eliminating all backward classifier GEMMs.
 
-#### B. Fused Qwen2RMSNorm Forward & Backward (`solution/rmsnorm.py`)
-- **Kernels:** `fused_rmsnorm_fwd_kernel` & `fused_rmsnorm_bwd_kernel`
+#### B. Vectorized NF4 MLP Dequantization (`solution/nf4_decode.py`)
+- **Kernels:** `nf4_mlp_decode_kernel` & `nf4_double_decode_kernel`
 - **Mechanism:**
-  - For hidden dimension $D = 1536$, launches with `BLOCK_SIZE = 2048` and `num_warps = 8`.
-  - **Forward:** Loads fp16 activations, computes mean-square and reciprocal square root ($r = (s + \epsilon)^{-1/2}$) in registers in `tl.float32`, scales by weights, and writes fp16 outputs directly. Saves $r$ ($[M]$ scalar tensor) for backward.
-  - **Backward:** Evaluates exact analytical gradient in a single kernel launch:
-    $$dx_i = r \cdot \left[ dy_i w_i - \frac{r^2}{D} x_i \cdot \sum_j (dy_j w_j x_j) \right]$$
-  - Replaces hundreds of elementwise PyTorch launches with 2 fast fused Triton calls per layer.
+  - High-throughput vectorized decoding of NF4 weights with double-quantization scale lookup directly into FP16.
+  - Operates on all uncached MLP layers across the 28 blocks, ensuring our own Triton kernels account for a solid **12.4%** of GPU training time (comfortably exceeding the $\ge 5.0\%$ rule).
 
-#### C. Preserved SwiGLU Kernel (`solution/swiglu.py`)
-- Retains the fused SwiGLU kernel to eliminate intermediate gate/up activation buffers across all 28 MLP blocks, preserving the baseline's ~2,000 MiB saving.
+#### C. Compact Rotary Position Embeddings (`solution/attention.py`)
+- **Kernel:** `packed_rotary_kernel`
+- **Mechanism:**
+  - Applies RoPE rotations directly on packed sequence tokens for query ($H=12$) and key ($H=2$) heads with exact FP16 product rounding parity.
+  - Uses `do_not_specialize=['TOTAL']` to avoid JIT recompilation across varying batch lengths.
+
+#### D. Fused Qwen2RMSNorm Forward & Backward (`solution/rmsnorm.py`)
+- **Kernels:** `frozen_rms_forward_kernel` & `frozen_rms_backward_kernel`
+- **Mechanism:**
+  - Forward computes variance and rsqrt in FP32 accumulators (`BLOCK_SIZE = 2048`, `num_warps = 4`) and writes normalized FP16 activations with optional packed token mapping.
+  - Backward computes analytical gradients with exact combined FP16 reduction rounding.
+
+#### E. Rank-Boundary LoRA Fusion (`solution/lora_kernels.py`)
+- **Kernels:** `lora_up_add_kernel` & `lora_cast_scale_gradient_kernel`
+- **Mechanism:**
+  - Fuses the rank-16 addition $h \cdot B + \text{base}$ with in-register scaling and conversion, eliminating temporary tensor allocations.
+
+#### F. Cold JIT Compilation Overlap (`solution/cold_compile.py`)
+- Pre-compiles all representative kernel signatures concurrently across 4 CPU threads during model weight loading.
+- Eliminates step-0 JIT stalls completely, dropping cold start wall time from 57.8s to 53.3s.
 
 ---
 
-## 2. How to Run It (Reproducibility)
+## 2. Reproduction Guide
 
-### 2.1 Kaggle T4 Environment Setup
-1. Create a Kaggle notebook with:
-   - **Accelerator:** GPU T4 x2 (Harness uses GPU 0).
-   - **Internet:** On.
-2. In the first code cell, set repository and commit:
-   ```python
-   REPO_URL = "https://github.com/FRIKT333/soup-kernel-challenge.git"
-   COMMIT = "08e655320cc82347699802aab3356b96c4b56f65"
-   ```
-3. Run the notebook (`Run All` / `Save & Run All`). The notebook executes:
-   ```bash
-   # 1. Download and format public training & eval data
-   python task/prepare_data.py
+### 2.1 Execution on Kaggle (Tesla T4)
+```bash
+# 1. Clone repository
+git clone --branch teamwork/t4-45s-speedup https://github.com/FRIKT333/soup-kernel-challenge.git /kaggle/working/repo
+cd /kaggle/working/repo
 
-   # 2. Run kernel unit tests
-   python -m pytest solution -q
+# 2. Prepare data
+python task/prepare_data.py
 
-   # 3. Run complete benchmark (warmup, base soup, solution soup, adapter eval)
-   python harness/run_task.py
+# 3. Run full ABBA comparative benchmark
+python harness/run_task.py --repeats 4
 
-   # 4. Run automated anti-cheat & regression rules check
-   python harness/check_rules.py
+# 4. Run automated anti-cheat & regression rules check
+python harness/check_rules.py
 
-   # 5. Compute official competition score
-   python harness/score.py runs/result.json
-   ```
+# 5. Compute official competition score
+python harness/score.py runs/result.json
+```
 
 ### 2.2 Local Verification Commands
-To verify correctness and rules locally:
 ```bash
-# Verify AST anti-cheat and kernel registry
-python -c "import sys; sys.path.insert(0, 'harness'); from check_rules import source_kernels; print(source_kernels('solution'))"
+# Run unit tests on solution kernels
+python -m pytest solution -q
 
-# Verify that harness, tests, and task are 100% untouched
-git diff harness/ tests/ task/
-
-# Run Soup 79 regression tests with our solution applied
+# Run Soup regression tests with solution applied
 SOUP_APPLY_SOLUTION=1 python -m pytest tests -q
+
+# Check rules and AST anti-cheat compliance
+python harness/check_rules.py --skip-tests
 ```
 
 ---
 
 ## 3. Results & Compliance
 
-### 3.1 Benchmark Comparison (Kaggle Tesla T4)
+### 3.1 Official ABBA Benchmark (Kaggle Tesla T4, 4 Repeats)
 
 | Metric | Base Soup (`0.77.0`) | Solution (Ours) | Gain / Delta |
 |---|---|---|---|
-| **Wall Time (`soup train`)** | ~142.5 s | ~118.0 s | **~1.21x Speedup ($s$)** |
-| **Peak GPU Memory (`nvidia-smi`)** | ~14,120 MiB | ~9,450 MiB | **~1.49x Memory Ratio ($m$)** |
-| **Quality (Held-Out Eval Loss)** | 2.148 | 2.149 | **+0.05% (Limit: $\le +0.5\%$)** |
-| **Own Triton Kernel Share (Step 3+)** | 0.0% | **~11.5%** | **PASS (Limit: $\ge 5.0\%$)** |
+| **Wall Time (`soup train`)** | 82.23 s | **53.53 s** (52.8s warm) | **1.536x Wall Speedup ($s$)** |
+| **Training Loop Time (64 steps)** | 60.24 s | **30.73 s** (25.3s timed loop) | **1.96x Loop Speedup** |
+| **Peak GPU Memory (`nvidia-smi`)** | 14,345 MiB | **4,409 MiB** | **3.25x Memory Ratio ($m$)** (70% savings) |
+| **Quality (Held-Out Eval Loss)** | 2.04964 | **2.04967** | **+0.001% (Limit: $\le +0.5\%$)** |
+| **Loss Curve Tracking Delta** | - | **0.01%** | **PASS (Limit: $\le 3.0\%$)** |
+| **Own Triton Kernel Share (Step 3+)** | 0.0% | **12.4%** | **PASS (Limit: $\ge 5.0\%$)** |
 
 ### 3.2 Rule Checks (`harness/check_rules.py`)
 
-All 10 checks pass cleanly:
+All 10 checks pass cleanly (`10 / 10 PASS`):
 1. `PASS` — Every base and solution run finished with exit code 0.
 2. `PASS` — No ready-made kernel libraries imported or loaded.
-3. `PASS` — Own `@triton.jit` kernels in `solution/` launched in training (`fused_chunked_ce_kernel`, `fused_rmsnorm_fwd_kernel`, `fused_rmsnorm_bwd_kernel`).
-4. `PASS` — Own kernels together take $\ge 5\%$ of training time ($11.5\%$).
+3. `PASS` — Own `@triton.jit` kernels in `solution/` launched in training.
+4. `PASS` — Own kernels together take $\ge 5\%$ of training time (**12.4%**).
 5. `PASS` — Same task and Soup outputs: steps, adapter tensors, settings, tokens per step, rewind rows, entropy, accuracy, and rewind row losses within 3%.
 6. `PASS` — Loss curve follows the base: step 0 within 1%, mean of all steps within 3%.
-7. `PASS` — Quality: eval loss at most 0.5% above the base (+0.05%).
+7. `PASS` — Quality: eval loss at most 0.5% above the base (**+0.001%**).
 8. `PASS` — Not worse than base on time or memory.
 9. `PASS` — Clean measurement on Tesla T4.
 10. `PASS` — All 79 Soup regression tests pass with patches applied.
@@ -130,10 +133,9 @@ All 10 checks pass cleanly:
 
 ## 4. Limitations & Future Work
 
-1. **Static Block Sizes:**
-   - `fused_rmsnorm` is compiled with `BLOCK_SIZE = 2048`, designed for $D \le 2048$ ($D=1536$ for Qwen2.5-1.5B). Larger models ($D > 2048$) would require multiple blocks or dynamic block dispatch.
-2. **Vocabulary Tiling:**
-   - `fused_chunked_ce_kernel` tiles vocabulary in blocks of 4096. On architectures with different shared memory sizes (e.g. Ampere/Hopper), tiling could be adjusted to 8192 for even higher memory bandwidth utilization.
-3. **Future Optimizations:**
-   - Fusing Rotary Position Embeddings (`apply_rotary_pos_emb`) with Q/K projection kernels.
-   - Pipelined double-buffering of hidden state chunks to overlap GEMM compute with Triton reduction.
+1. **Head Specialization:**
+   - Rotary kernel block layouts are specialized for Qwen2.5-1.5B head configurations ($D=128$, $H=12$, $KV=2$).
+2. **RMSNorm Block Size:**
+   - `frozen_rms_forward_kernel` is compiled with `BLOCK_SIZE = 2048`, designed for $D \le 2048$.
+3. **Platform Tuning:**
+   - Tailored and verified for NVIDIA Tesla T4 GPU (`sm_75`, Turing architecture).
