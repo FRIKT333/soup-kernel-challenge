@@ -1,142 +1,135 @@
-"""Fused Qwen2RMSNorm forward and backward in Triton.
+"""One-pass RMSNorm forward/backward for Qwen's frozen norm weights."""
 
-Eliminates multiple elementwise PyTorch kernel launches per normalization layer,
-performing mean-square reduction, rsqrt, scaling, and backward gradient computation
-entirely within registers in float32 precision.
-"""
+from functools import wraps
 
 import torch
 import triton
 import triton.language as tl
+from torch.autograd.function import once_differentiable
 
 
 @triton.jit
-def fused_rmsnorm_fwd_kernel(
-    x_ptr,
-    w_ptr,
-    y_ptr,
-    r_ptr,
-    stride_x,
-    stride_y,
-    D: tl.constexpr,
-    eps: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    row_idx = tl.program_id(0)
-    cols = tl.arange(0, BLOCK_SIZE)
-    mask = cols < D
-
-    x = tl.load(x_ptr + row_idx * stride_x + cols, mask=mask, other=0.0).to(tl.float32)
-    w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-
-    var = tl.sum(x * x, axis=0) / D
-    r = tl.rsqrt(var + eps)
-    tl.store(r_ptr + row_idx, r)
-
-    y = (x * r) * w
-    tl.store(y_ptr + row_idx * stride_y + cols, y.to(y_ptr.dtype.element_ty), mask=mask)
+def frozen_rms_forward_kernel(X, W, Y, INV, MAP, PACKED, N: tl.constexpr,
+                              EPS: tl.constexpr, BLOCK: tl.constexpr, PACK: tl.constexpr):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    x = tl.load(X + row * N + cols, cols < N, 0).to(tl.float32)
+    w = tl.load(W + cols, cols < N, 0).to(tl.float32)
+    inv = tl.rsqrt(tl.sum(x * x, axis=0) / N + EPS)
+    # Qwen casts the normalized value back BEFORE multiplying by its FP32 weight.
+    normalized = (x * inv).to(X.dtype.element_ty).to(tl.float32)
+    tl.store(Y + row * N + cols, w * normalized, cols < N)
+    if PACK:
+        target = tl.load(MAP + row)
+        tl.store(PACKED + target * N + cols, w * normalized, (cols < N) & (target >= 0))
+    tl.store(INV + row, inv)
 
 
 @triton.jit
-def fused_rmsnorm_bwd_kernel(
-    dy_ptr,
-    x_ptr,
-    w_ptr,
-    r_ptr,
-    dx_ptr,
-    stride_dy,
-    stride_x,
-    stride_dx,
-    D: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    row_idx = tl.program_id(0)
-    cols = tl.arange(0, BLOCK_SIZE)
-    mask = cols < D
-
-    dy = tl.load(dy_ptr + row_idx * stride_dy + cols, mask=mask, other=0.0).to(tl.float32)
-    x = tl.load(x_ptr + row_idx * stride_x + cols, mask=mask, other=0.0).to(tl.float32)
-    w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    r = tl.load(r_ptr + row_idx)
-
-    dy_w = dy * w
-    c = tl.sum(dy_w * x, axis=0)
-    dx = r * (dy_w - (r * r / D) * x * c)
-
-    tl.store(dx_ptr + row_idx * stride_dx + cols, dx.to(dx_ptr.dtype.element_ty), mask=mask)
+def frozen_rms_backward_kernel(G, GP, X, W, INV, MAP, DX, N: tl.constexpr,
+                               BLOCK: tl.constexpr, FULL: tl.constexpr, PACK: tl.constexpr,
+                               ROUND_COMBINED: tl.constexpr = False):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    x = tl.load(X + row * N + cols, cols < N, 0).to(tl.float32)
+    g = tl.full((BLOCK,), 0, tl.float32)
+    if FULL:
+        g += tl.load(G + row * N + cols, cols < N, 0).to(tl.float32)
+    if PACK:
+        source = tl.load(MAP + row)
+        g += tl.load(GP + source * N + cols, (cols < N) & (source >= 0), 0).to(tl.float32)
+    # Autograd sums gradients in the forward output dtype before the norm.
+    if ROUND_COMBINED and FULL and PACK:
+        g = g.to(X.dtype.element_ty).to(tl.float32)
+    w = tl.load(W + cols, cols < N, 0).to(tl.float32)
+    inv = tl.load(INV + row)
+    gw = (g * w).to(X.dtype.element_ty).to(tl.float32)
+    correction = tl.sum(gw * x, axis=0) / N
+    dx = gw * inv - x * (inv * inv * inv * correction)
+    tl.store(DX + row * N + cols, dx, cols < N)
 
 
-class FusedRMSNormFunc(torch.autograd.Function):
+class FrozenRMSNorm(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight, eps=1e-6):
-        orig_shape = x.shape
-        x_2d = x.reshape(-1, orig_shape[-1]).contiguous()
-        M, D = x_2d.shape
-        y_2d = torch.empty_like(x_2d)
-        r = torch.empty(M, device=x.device, dtype=torch.float32)
-
-        BLOCK_SIZE = triton.next_power_of_2(D)
-        num_warps = 8 if D >= 1024 else 4
-        fused_rmsnorm_fwd_kernel[(M,)](
-            x_2d,
-            weight,
-            y_2d,
-            r,
-            x_2d.stride(0),
-            y_2d.stride(0),
-            D=D,
-            eps=eps,
-            BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=num_warps,
-        )
-        ctx.save_for_backward(x_2d, weight, r)
-        ctx.orig_shape = orig_shape
-        ctx.D = D
-        ctx.eps = eps
-        return y_2d.reshape(orig_shape)
+    def forward(ctx, x, weight, eps):
+        x = x.contiguous()
+        n = x.shape[-1]
+        inv = torch.empty((x.numel() // n,), device=x.device, dtype=torch.float32)
+        from .precision import half_activations
+        dtype = x.dtype if half_activations.get() else torch.promote_types(x.dtype, weight.dtype)
+        y = torch.empty_like(x, dtype=dtype)
+        frozen_rms_forward_kernel[(inv.numel(),)](
+            x, weight, y, inv, x, x, n, float(eps), triton.next_power_of_2(n), False,
+            num_warps=4, enable_fp_fusion=False)
+        ctx.save_for_backward(x, weight, inv)
+        return y
 
     @staticmethod
-    def backward(ctx, dy):
-        x_2d, weight, r = ctx.saved_tensors
-        orig_shape = ctx.orig_shape
-        dy_2d = dy.reshape(-1, orig_shape[-1]).contiguous()
-        M, D = x_2d.shape
-        dx_2d = torch.empty_like(x_2d)
-
-        BLOCK_SIZE = triton.next_power_of_2(D)
-        num_warps = 8 if D >= 1024 else 4
-        fused_rmsnorm_bwd_kernel[(M,)](
-            dy_2d,
-            x_2d,
-            weight,
-            r,
-            dx_2d,
-            dy_2d.stride(0),
-            x_2d.stride(0),
-            dx_2d.stride(0),
-            D=D,
-            BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=num_warps,
-        )
-        dw = None
-        if ctx.needs_input_grad[1]:
-            dw = (dy_2d.float() * (x_2d.float() * r.unsqueeze(1))).sum(dim=0).to(weight.dtype)
-        return dx_2d.reshape(orig_shape), dw, None
+    @once_differentiable
+    def backward(ctx, grad):
+        x, weight, inv = ctx.saved_tensors
+        grad = grad.contiguous()
+        dx = torch.empty_like(x)
+        frozen_rms_backward_kernel[(inv.numel(),)](
+            grad, grad, x, weight, inv, x, dx, x.shape[-1], triton.next_power_of_2(x.shape[-1]), True, False,
+            num_warps=4, enable_fp_fusion=False)
+        return dx, None, None
 
 
-def fused_rmsnorm(x, weight, eps=1e-6):
-    return FusedRMSNormFunc.apply(x, weight, eps)
+class PackedRMSNorm(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, eps, indices, inverse):
+        x = x.contiguous()
+        n = x.shape[-1]
+        inv = torch.empty((x.numel() // n,), device=x.device, dtype=torch.float32)
+        from .precision import half_activations
+        dtype = x.dtype if half_activations.get() else torch.promote_types(x.dtype, weight.dtype)
+        full = torch.empty_like(x, dtype=dtype)
+        packed = torch.empty((indices.numel(), n), device=x.device, dtype=dtype)
+        frozen_rms_forward_kernel[(inv.numel(),)](
+            x, weight, full, inv, inverse, packed, n, float(eps), triton.next_power_of_2(n), True,
+            num_warps=4, enable_fp_fusion=False)
+        ctx.save_for_backward(x, weight, inv, inverse)
+        ctx.round_combined = dtype == torch.float16
+        ctx.set_materialize_grads(False)
+        return full, packed
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, full_grad, packed_grad):
+        x, weight, inv, inverse = ctx.saved_tensors
+        has_full, has_packed = full_grad is not None, packed_grad is not None
+        g = full_grad.contiguous() if has_full else x
+        gp = packed_grad.contiguous() if has_packed else x
+        dx = torch.empty_like(x)
+        frozen_rms_backward_kernel[(inv.numel(),)](
+            g, gp, x, weight, inv, inverse, dx, x.shape[-1], triton.next_power_of_2(x.shape[-1]),
+            has_full, has_packed, ctx.round_combined, num_warps=4, enable_fp_fusion=False)
+        return dx, None, None, None, None
 
 
 def patch_qwen2_rmsnorm():
-    """Patch Qwen2RMSNorm.forward to use the fused Triton kernel on CUDA."""
-    from transformers.models.qwen2 import modeling_qwen2
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 
-    original_forward = modeling_qwen2.Qwen2RMSNorm.forward
+    original = Qwen2RMSNorm.forward
+    if getattr(original, "_frozen_rms_patched", False):
+        return
 
+    @wraps(original)
     def forward(self, hidden_states):
-        if not getattr(hidden_states, "is_cuda", False) or hidden_states.shape[-1] > 2048:
-            return original_forward(self, hidden_states)
-        return FusedRMSNormFunc.apply(hidden_states, self.weight, self.variance_epsilon)
+        if (not hidden_states.is_cuda or hidden_states.numel() == 0
+                or hidden_states.shape[-1] != 1536 or self.weight.requires_grad
+                or self.weight.dtype != torch.float32 or not self.weight.is_contiguous()
+                or hidden_states.dtype not in (torch.float16, torch.float32)):
+            return original(self, hidden_states)
+        from .compact import _tokens
+        state = _tokens.get()
+        if state is not None and hidden_states.ndim == 3 and hidden_states.shape[:2] == state[0]:
+            full, packed = PackedRMSNorm.apply(hidden_states, self.weight, self.variance_epsilon,
+                                               state[1], state[2])
+            full._packed_normalization = (state[1], packed)
+            return full
+        return FrozenRMSNorm.apply(hidden_states, self.weight, self.variance_epsilon)
 
-    modeling_qwen2.Qwen2RMSNorm.forward = forward
+    forward._frozen_rms_patched = True
+    Qwen2RMSNorm.forward = forward
