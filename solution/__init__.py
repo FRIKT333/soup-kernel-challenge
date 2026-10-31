@@ -14,9 +14,6 @@ The rules in short (the README and the task statement have the full ones):
 """
 
 def apply():
-    from .cold_compile import start, install_barrier
-    start()
-
     from .startup import prime_dependency_metadata, patch_preprocessing
     prime_dependency_metadata()
 
@@ -42,4 +39,8 @@ def apply():
     patch_online_head()
     from .packed_decoder import patch_packed_decoder
     patch_packed_decoder()
+
+    # Overlap cold kernel compilation with dataset prep and model weight loading
+    from .cold_compile import start, install_barrier
+    start()
     install_barrier()

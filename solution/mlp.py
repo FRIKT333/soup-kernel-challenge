@@ -20,15 +20,15 @@ def example_joint_swiglu_fwd_kernel(GU, OUT, N, WIDTH: tl.constexpr, BLOCK: tl.c
 
 
 @triton.jit(do_not_specialize=['N'])
-def example_joint_swiglu_bwd_kernel(DH, GU, DGU, N, WIDTH: tl.constexpr, BLOCK: tl.constexpr):
+def example_joint_swiglu_bwd_kernel(DH, GU, DG, DU, N, WIDTH: tl.constexpr, BLOCK: tl.constexpr):
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     pos = i // WIDTH * (2 * WIDTH) + i % WIDTH
     gate = tl.load(GU + pos, i < N, 0).to(tl.float32)
     up = tl.load(GU + pos + WIDTH, i < N, 0).to(tl.float32)
     grad = tl.load(DH + i, i < N, 0).to(tl.float32)
     sig = tl.sigmoid(gate)
-    tl.store(DGU + pos, grad * up * sig * (1.0 + gate * (1.0 - sig)), i < N)
-    tl.store(DGU + pos + WIDTH, grad * gate * sig, i < N)
+    tl.store(DG + i, grad * up * sig * (1.0 + gate * (1.0 - sig)), i < N)
+    tl.store(DU + i, grad * gate * sig, i < N)
 
 
 class FrozenMLP(torch.autograd.Function):
@@ -54,10 +54,11 @@ class FrozenMLP(torch.autograd.Function):
         size = h * width
         dense = decode_mlp((gate, up, down), ctx.states)
         dh = torch.mm(grad.reshape(-1, h).half(), dense[2*size:].view(h, width))
-        dgu = torch.empty_like(gu)
+        dg, du = torch.empty_like(dh), torch.empty_like(dh)
         n = dh.numel()
-        example_joint_swiglu_bwd_kernel[(triton.cdiv(n, 1024),)](dh, gu, dgu, n, width, 1024)
-        dx = torch.mm(dgu, dense[:2*size].view(2*width, h)).to(ctx.dtype)
+        example_joint_swiglu_bwd_kernel[(triton.cdiv(n, 1024),)](dh, gu, dg, du, n, width, 1024)
+        dx = torch.mm(dg, dense[:size].view(width, h)).to(ctx.dtype)
+        dx.add_(torch.mm(du, dense[size:2*size].view(width, h)).to(ctx.dtype))
         return dx.reshape(ctx.shape), None, None, None, None
 
 

@@ -65,7 +65,7 @@ def _jobs(buffers):
     yield example_swiglu_fwd_kernel, (h, h, h, 701 * 8960, 1024), {}
     yield example_swiglu_bwd_kernel, (h, h, h, h, h, 701 * 8960, 1024), {}
     yield example_joint_swiglu_fwd_kernel, (h, h, 701 * 8960, 8960, 1024), {}
-    yield example_joint_swiglu_bwd_kernel, (h, h, h, 701 * 8960, 8960, 1024), {}
+    yield example_joint_swiglu_bwd_kernel, (h, h, h, h, 701 * 8960, 8960, 1024), {}
 
 
 class Compilation:
